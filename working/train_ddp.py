@@ -25,6 +25,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import lr_scheduler
 from torch.utils.data import Dataset, DataLoader
 
+from apex import amp
+
 from torchvision import transforms
 from torchvision.models import resnet18, resnet34, resnet50, resnet101, resnet152
 
@@ -64,24 +66,26 @@ if local_rank == 0:
     print(f'Num_classes is : {train_metadata.individual_id.nunique()}')
 
 # 带有预训练的模型
-model_names = timm.list_models(pretrained=True)
-if local_rank == 0:
-    for model in model_names:
-        if 'eff' in model:
-            print(model)
+# model_names = timm.list_models(pretrained=True)
+# if local_rank == 0:
+#     for model in model_names:
+#         if 'eff' in model:
+#             print(model)
 
 CONFIG = {
     'RANDOM_SEED': 2022,
     'N_SPLITS': 5,
     'img_size': 448,
-    'epochs': 10,
+    'epochs': 20,
+    'experiment_id': 'eff-b0-test',
+    'embedding_size': 512,
     'train_dataloader': {
-        'batch_size': 4,
+        'batch_size': 24,
         'shuffle': True,
         'num_workers': 20,
     },
     'val_dataloader': {
-        'batch_size': 4,
+        'batch_size': 24,
         'shuffle': False,
         'num_workers': 20,
     },
@@ -91,7 +95,7 @@ CONFIG = {
         'num_workers': 20,
     },
     'model': {
-        'name': 'tf_efficientnet_b6_ns',
+        'name': 'tf_efficientnet_b0_ns',
         'output_dim': 15587,
     },
     'arcface_module': {
@@ -105,20 +109,24 @@ CONFIG = {
     'optimizer': {
         'name': 'optim.Adam',
         'params': {
-                'lr': 1e-4,
+                'lr': 5e-4,
         }
     },
     # 学习率衰减
     'scheduler': {
         'name': 'optim.lr_scheduler.CosineAnnealingLR',
         'params': {
-                'T_max': 20,
+                'T_max': 500,
                 'eta_min': 1e-6,
         }
     },
 
 }
 config = Box(CONFIG)
+
+save_location = os.path.join(save_path, config.experiment_id)
+if not os.path.exists(save_location):
+    os.makedirs(save_location)
 
 
 def set_seed(seed):
@@ -154,14 +162,14 @@ def get_default_transforms(mode):
     if mode == 'train':
         aug = albumentations.Compose([
             albumentations.Resize(config.img_size, config.img_size, p=1),
-                        albumentations.HorizontalFlip(p=0.5),
-                        albumentations.RandomRotate90(p=0.5),
-                        albumentations.HueSaturationValue(
-                            hue_shift_limit=0.2, sat_shift_limit=0.2, val_shift_limit=0.2, p=0.5
-                        ),
-                        albumentations.RandomBrightnessContrast(
-                            brightness_limit=(-0.1, 0.1), contrast_limit=(-0.1, 0.1), p=0.5
-                        ),
+            albumentations.HorizontalFlip(p=0.5),
+            albumentations.RandomRotate90(p=0.5),
+            albumentations.HueSaturationValue(
+                hue_shift_limit=0.2, sat_shift_limit=0.2, val_shift_limit=0.2, p=0.5
+            ),
+            albumentations.RandomBrightnessContrast(
+                brightness_limit=(-0.1, 0.1), contrast_limit=(-0.1, 0.1), p=0.5
+            ),
             albumentations.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
@@ -206,26 +214,6 @@ class Train_HappyWhaleDataSet(Dataset):
             img = self.transforms(image=img)['image']
 
         return img, label
-
-
-class Test_HappyWhaleDataSet(Dataset):
-    def __init__(self, df, transforms=None):
-        # df的某一列为series,series的values为numpy.array
-        self.img_name = df['image'].values
-        self.transforms = transforms
-
-    def __len__(self):
-        return len(self.img_name)
-
-    def __getitem__(self, idx):
-        img_name = self.img_name[idx]
-        img = cv2.imread(os.path.join(test_path, img_name))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img_Id = img_name
-        if self.transforms != None:
-            img = self.transforms(image=img)['image']
-
-        return img, img_Id
 
 
 class ArcMarginProduct(nn.Module):
@@ -305,14 +293,16 @@ class HappyWhaleModel(nn.Module):
         super(HappyWhaleModel, self).__init__()
         self.cfg = config
         self.backbone = timm.create_model(
-            self.cfg.model.name, pretrained=True, in_chans=3)
+            self.cfg.model.name, pretrained=True)
         self.num_features = self.backbone.num_features
         if self.cfg.arcface_module.use_arcface:
             in_features = self.backbone.classifier.in_features
             self.backbone.classifier = nn.Identity()
             self.backbone.global_pool = nn.Identity()
             self.pooling = GeM()
-            self.fc = ArcMarginProduct(in_features,
+            # self.drop = nn.Dropout(p=0.2, inplace=False)
+            self.embedding = nn.Linear(in_features, config.embedding_size)
+            self.fc = ArcMarginProduct(config.embedding_size,
                                        self.cfg.model.output_dim,
                                        s=self.cfg.arcface_module.s,
                                        m=self.cfg.arcface_module.m,
@@ -322,13 +312,15 @@ class HappyWhaleModel(nn.Module):
             self.fc = nn.Linear(self.num_features, self.cfg.model.output_dim)
 
     def forward(self, x, labels=None):
-        x = self.backbone(x)
+        features = self.backbone(x)
         if self.cfg.arcface_module.use_arcface:
-            x = self.pooling(x).flatten(1)
+            pooled_features = self.pooling(features).flatten(1)
+            embedding = self.embedding(pooled_features)
+            # pooled_drop = self.drop(x)
             if labels == None:
-                x = self.fc.extract_feat(x)
+                x = self.fc.extract_feat(pooled_features)
                 return x
-            out = self.fc(x, labels)
+            out = self.fc(embedding, labels)
         else:
             out = self.fc(x)
 
@@ -350,8 +342,6 @@ def reduce_tensor(tensor, reduction=True):
 
 # 自定义损失
 # 多分类的交叉熵损失，损失函数声明记得加括号
-
-
 def criterion(outputs, targets):
     return nn.CrossEntropyLoss()(outputs, targets)
 
@@ -426,8 +416,6 @@ def Train(model, train_dataloader, epoch, optimizer, scheduler):
         target_list = gather_tensor(labels)
         target_list = torch.cat(target_list, 0)
         _, top5_index = id_preds_gather.topk(5, 1, True, True)
-
-
 
         # 反向传播
         optimizer.zero_grad()
@@ -511,8 +499,6 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(train_metadata)):
     model = HappyWhaleModel(config)
     # 模型加载到当前GPU上
     model.cuda(device)
-    # DDP包裹
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     # model.cuda()
     #     test_model = create_model()
@@ -521,6 +507,8 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(train_metadata)):
         model.parameters(), lr=config.optimizer.params.lr)
     scheduler = eval(config.scheduler.name)(optimizer, T_max=config.scheduler.params.T_max,
                                             eta_min=config.scheduler.params.eta_min)
+    # DDP包裹
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     if local_rank == 0:
         print('=' * 25, f'Fold : {fold + 1} training', '=' * 25)
     # train_DataSet
@@ -545,7 +533,6 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(train_metadata)):
 
     best_loss = np.inf
     time_1 = time.time()
-    os.makedirs(save_path+'eff-b6_448/',exist_ok = True)
     for epoch in range(config.epochs):
         # train
         model, train_avg_loss = Train(
@@ -558,10 +545,11 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(train_metadata)):
                 f'Epoch [{epoch + 1}] train_avg_Loss : {train_avg_loss}, val_avg_Loss : {val_avg_loss}, val_avg_acc:{val_avg_acc}')
             if val_avg_loss <= best_loss:
                 best_loss = val_avg_loss
-                torch.save(model.state_dict(), save_path +
-                           'eff-b6_448/' + f'fold_{fold}_best_epoch.pth')
+                torch.save(model.state_dict(), save_location +
+                                                f'/fold_{fold}_best_epoch.pth')
             time_2 = time.time()
             print((time_2 - time_1) / 60)
     if local_rank == 0:
         print('=' * 10, f'Fold : {fold + 1} result', '=' * 10)
         print(f'Best_Loss : {best_loss}')
+    break
