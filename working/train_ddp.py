@@ -365,6 +365,7 @@ def map_per_image(label, predictions):
     except ValueError:
         return 0.0
 
+
 def map_per_set(labels, predictions):
     """Computes the average over multiple images.
 
