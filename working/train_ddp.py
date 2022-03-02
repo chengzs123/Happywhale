@@ -50,11 +50,19 @@ dist.init_process_group(backend='nccl')
 # 设置GPU设备
 device = torch.device('cuda', local_rank)
 
+'''
 train_path = '/data/cheng/experiment/train_images/'
 test_path = '/data/cheng/experiment/test_images/'
 train_metadata_path = '/data/cheng/experiment/train.csv'
 submission_path = '/data/cheng/experiment/sample_submission.csv'
 save_path = '/data/cheng/experiment/result/ckpt/'
+'''
+
+train_path = '/data/data_ext/zry/happywhale/data/train_images/'
+test_path = '/data/data_ext/zry/happywhale/data/test_images/'
+train_metadata_path = '/data/data_ext/zry/happywhale/data/train.csv'
+submission_path = '/data/data_ext/zry/happywhale/data/sample_submission.csv'
+save_path = '/data/data_ext/zry/happywhale/result/'
 
 train_num = len(os.listdir(train_path))
 test_num = len(os.listdir(test_path))
@@ -77,7 +85,7 @@ CONFIG = {
     'N_SPLITS': 5,
     'img_size': 448,
     'epochs': 20,
-    'experiment_id': 'eff-b0-test',
+    'experiment_id': 'eff-b0-cutout',
     'embedding_size': 512,
     'train_dataloader': {
         'batch_size': 24,
@@ -162,6 +170,7 @@ def get_default_transforms(mode):
     if mode == 'train':
         aug = albumentations.Compose([
             albumentations.Resize(config.img_size, config.img_size, p=1),
+            albumentations.CoarseDropout(max_holes=20, max_height=20, max_width=20, fill_value=64, p=0.5),
             albumentations.HorizontalFlip(p=0.5),
             albumentations.RandomRotate90(p=0.5),
             albumentations.HueSaturationValue(
