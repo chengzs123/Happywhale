@@ -489,7 +489,6 @@ def Val(model, val_dataloader, epoch):
 
     return val_avg_loss, val_avg_acc
 
-
 # 五折交叉验证
 preds = np.zeros(test_num)
 kf = KFold(n_splits=config.N_SPLITS, shuffle=True,
