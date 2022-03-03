@@ -9,6 +9,7 @@ import math
 
 import timm
 
+
 from tqdm import tqdm
 
 import faiss
